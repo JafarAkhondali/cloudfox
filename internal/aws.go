@@ -43,6 +43,10 @@ var (
 	// timeouts on access-denied errors.
 	MaxRetries = 3
 
+	// AWSBaseEndpoint overrides the endpoint used by every AWS service client.
+	// An empty value leaves the SDK's default endpoint resolution unchanged.
+	AWSBaseEndpoint string
+
 	// unreachableRegions tracks regions that failed a TCP connectivity check so
 	// they can be skipped for the remainder of the run. Protected by a mutex
 	// since multiple goroutines may probe regions concurrently.
@@ -148,25 +152,7 @@ func AWSConfigFileLoader(AWSProfile string, version string, AwsMfaToken string) 
 	// The AssumeRoleOptions below are used to pass the MFA token to the AssumeRole call (when applicable)
 	if _, ok := ConfigMap[AWSProfile]; !ok {
 		// Ensures the profile in the aws config file meets all requirements (valid keys and a region defined). I noticed some calls fail without a default region.
-		if AwsMfaToken != "" {
-			cfg, err = config.LoadDefaultConfig(context.TODO(), config.WithSharedConfigProfile(AWSProfile), config.WithDefaultRegion("us-east-1"), config.WithRetryer(
-				func() aws.Retryer {
-					return retry.AddWithMaxAttempts(retry.NewStandard(), MaxRetries)
-				}), config.WithAssumeRoleCredentialOptions(func(options *stscreds.AssumeRoleOptions) {
-				options.TokenProvider = func() (string, error) {
-					return AwsMfaToken, nil
-				}
-			}),
-			)
-		} else {
-			cfg, err = config.LoadDefaultConfig(context.TODO(), config.WithSharedConfigProfile(AWSProfile), config.WithDefaultRegion("us-east-1"), config.WithRetryer(
-				func() aws.Retryer {
-					return retry.AddWithMaxAttempts(retry.NewStandard(), MaxRetries)
-				}), config.WithAssumeRoleCredentialOptions(func(options *stscreds.AssumeRoleOptions) {
-				options.TokenProvider = stscreds.StdinTokenProvider
-			}),
-			)
-		}
+		cfg, err = config.LoadDefaultConfig(context.TODO(), awsConfigLoadOptions(AWSProfile, AwsMfaToken)...)
 
 		if err != nil {
 			//fmt.Println(err)
@@ -203,6 +189,31 @@ func AWSConfigFileLoader(AWSProfile string, version string, AwsMfaToken string) 
 	return cfg
 }
 
+func awsConfigLoadOptions(AWSProfile string, AwsMfaToken string) []func(*config.LoadOptions) error {
+	tokenProvider := stscreds.StdinTokenProvider
+	if AwsMfaToken != "" {
+		tokenProvider = func() (string, error) {
+			return AwsMfaToken, nil
+		}
+	}
+
+	options := []func(*config.LoadOptions) error{
+		config.WithSharedConfigProfile(AWSProfile),
+		config.WithDefaultRegion("us-east-1"),
+		config.WithRetryer(func() aws.Retryer {
+			return retry.AddWithMaxAttempts(retry.NewStandard(), MaxRetries)
+		}),
+		config.WithAssumeRoleCredentialOptions(func(options *stscreds.AssumeRoleOptions) {
+			options.TokenProvider = tokenProvider
+		}),
+	}
+	if AWSBaseEndpoint != "" {
+		options = append(options, config.WithBaseEndpoint(AWSBaseEndpoint))
+	}
+
+	return options
+}
+
 func AWSWhoami(awsProfile string, version string, AwsMfaToken string) (*sts.GetCallerIdentityOutput, error) {
 
 	cacheKey := fmt.Sprintf("sts-getCallerIdentity-%s", awsProfile)
@@ -234,6 +245,13 @@ func AWSWhoami(awsProfile string, version string, AwsMfaToken string) (*sts.GetC
 // connection succeeds, the region is reachable. Results are cached so each region
 // is only probed once per run.
 func isRegionReachable(region string) bool {
+	// A custom endpoint handles routing independently of AWS's regional STS
+	// endpoints, so probing the public endpoint would be misleading and could
+	// bypass the requested endpoint entirely.
+	if AWSBaseEndpoint != "" {
+		return true
+	}
+
 	unreachableRegionsMu.RLock()
 	alreadyUnreachable := unreachableRegions[region]
 	unreachableRegionsMu.RUnlock()
