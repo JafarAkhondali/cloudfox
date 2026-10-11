@@ -1,10 +1,15 @@
 package internal
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/spf13/afero"
 )
 
@@ -73,5 +78,66 @@ func TestGetSelectedAWSProfiles(t *testing.T) {
 		if !compareSlice(output, test.expectedOutput) {
 			t.Errorf("Test Failed: %v inputted, %v expected, received: %v", test.fileData, test.expectedOutput, output)
 		}
+	}
+}
+
+func TestAWSConfigFileLoaderCustomEndpoint(t *testing.T) {
+	const accountID = "123456789012"
+
+	requestURL := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestURL <- r.URL.String()
+		w.Header().Set("Content-Type", "text/xml")
+		fmt.Fprintf(w, `<GetCallerIdentityResponse>
+	<GetCallerIdentityResult>
+		<Account>%s</Account>
+		<Arn>arn:aws:iam::%s:user/cloudfox</Arn>
+		<UserId>AIDACLOUDFOX</UserId>
+	</GetCallerIdentityResult>
+</GetCallerIdentityResponse>`, accountID, accountID)
+	}))
+	t.Cleanup(server.Close)
+
+	originalEndpoint := AWSBaseEndpoint
+	originalConfigMap := ConfigMap
+	t.Cleanup(func() {
+		AWSBaseEndpoint = originalEndpoint
+		ConfigMap = originalConfigMap
+	})
+
+	AWSBaseEndpoint = server.URL
+	ConfigMap = map[string]aws.Config{}
+	t.Setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_ENDPOINT_URL", "")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	cfg := AWSConfigFileLoader("", "test", "")
+	if cfg.BaseEndpoint == nil || aws.ToString(cfg.BaseEndpoint) != server.URL {
+		t.Fatalf("expected base endpoint %q, got %v", server.URL, cfg.BaseEndpoint)
+	}
+
+	caller, err := sts.NewFromConfig(cfg).GetCallerIdentity(context.Background(), &sts.GetCallerIdentityInput{})
+	if err != nil {
+		t.Fatalf("GetCallerIdentity returned an error: %v", err)
+	}
+	if got := aws.ToString(caller.Account); got != accountID {
+		t.Errorf("expected account ID %q, got %q", accountID, got)
+	}
+	if got := <-requestURL; got != "/" {
+		t.Errorf("expected request to custom endpoint root, got %q", got)
+	}
+}
+
+func TestCustomEndpointSkipsRegionalAWSProbe(t *testing.T) {
+	originalEndpoint := AWSBaseEndpoint
+	t.Cleanup(func() {
+		AWSBaseEndpoint = originalEndpoint
+	})
+
+	AWSBaseEndpoint = "http://localhost:4566"
+	if !isRegionReachable("not-a-real-region") {
+		t.Error("expected a custom endpoint to skip the public regional STS probe")
 	}
 }
